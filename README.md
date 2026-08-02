@@ -8,6 +8,7 @@ A robust, production-ready web page mirror utility that downloads HTML pages and
 - **Connection Pooling**: Efficient HTTP connections via `requests.Session`
 - **Retry Logic**: Automatic retries for transient failures (500-504, 429)
 - **Depth Control**: Prevents runaway downloads with configurable recursion limit
+- **Single-Page Mode**: Only fetch assets needed to render one page
 - **Referer Support**: Bypass origin-checking servers with custom referer headers
 - **file:// Support**: Handles local file paths alongside HTTP/HTTPS URLs
 - **Graceful Error Handling**: Specific handlers for timeouts, connection errors, and HTTP failures
@@ -39,6 +40,9 @@ python mirror_page.py https://example.com ./mirror -r "https://example.com"
 # Recursive download up to depth 3
 python mirror_page.py https://example.com ./mirror -d 3
 
+# Single-page mode: only the assets this one page needs to render
+python mirror_page.py https://example.com ./mirror --single-page
+
 # Mirror a local file
 python mirror_page.py file:///path/to/page.html ./output
 ```
@@ -48,7 +52,8 @@ python mirror_page.py file:///path/to/page.html ./output
 | Flag | Description | Default |
 |------|-------------|---------|
 | `-d, --depth N` | Maximum recursive depth for linked resources | 1 |
-| `-r, --referer URL` | Referer header for requests | None |
+| `-r, --referer URL` | Referer header for requests (bypasses origin checks) | None |
+| `--single-page` | Download only the resources needed to render this one page | off |
 | `--no-verify` | Disable TLS certificate verification (e.g. self-signed certs) | off |
 
 ## 🧪 Testing
