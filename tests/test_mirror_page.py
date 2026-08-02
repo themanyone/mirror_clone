@@ -15,6 +15,7 @@ from mirror_page import (
     validate_url,
     extract_resources,
     extract_css_dependencies,
+    extract_js_dependencies,
     download_resource,
     mirror_page,
     parse_args,
@@ -149,6 +150,40 @@ class TestExtractCssDependencies:
         css = "@import url(other.css);"
         deps = extract_css_dependencies(css, "http://example.com/css/main.css")
         assert deps == ["http://example.com/css/other.css"]
+
+
+class TestExtractJsDependencies:
+    """Test JS module import extraction."""
+
+    def test_static_import(self):
+        """Should extract a resolved relative import."""
+        js = 'import { x } from "./sub/util.js";'
+        deps = extract_js_dependencies(js, "http://example.com/js/app.mjs")
+        assert deps == ["http://example.com/js/sub/util.js"]
+
+    def test_dynamic_import(self):
+        """Should extract dynamic import() specifiers."""
+        js = 'const mod = import("./lazy.mjs");'
+        deps = extract_js_dependencies(js, "http://example.com/js/app.js")
+        assert deps == ["http://example.com/js/lazy.mjs"]
+
+    def test_skips_bare_specifiers(self):
+        """Should skip bare package names (e.g. node_modules imports)."""
+        js = 'import React from "react"; import "./style.css";'
+        deps = extract_js_dependencies(js, "http://example.com/js/app.js")
+        assert deps == []
+
+    def test_skips_remote_urls(self):
+        """Should skip imports of remote URLs."""
+        js = 'import "https://cdn.example.com/lib.js";'
+        deps = extract_js_dependencies(js, "http://example.com/js/app.js")
+        assert deps == []
+
+    def test_skips_comments(self):
+        """Should not match module specifiers inside comments."""
+        js = '// import "./commented.js";\nimport "./real.mjs";'
+        deps = extract_js_dependencies(js, "http://example.com/js/app.js")
+        assert deps == ["http://example.com/js/real.mjs"]
 
 
 class TestCreateSession:
@@ -408,6 +443,40 @@ class TestMirrorPage:
         assert (output_dir / "extra.css").exists()
         assert (output_dir / "bg.png").exists()
         assert (output_dir / "icon.gif").exists()
+
+    def test_mirror_single_page_downloads_js_modules(self, tmp_path):
+        """Single-page mode should download local JS modules via imports."""
+        # Main page loads a module script which imports further modules.
+        main = tmp_path / "main.html"
+        main.write_text(
+            '<html><script type="module" src="app.mjs"></script>'
+            '<a href="other.html">O</a></html>'
+        )
+        (tmp_path / "app.mjs").write_text(
+            'import { x } from "./sub/util.js";'
+            'import("./lazy.mjs");'
+        )
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        (sub / "util.js").write_text("export const x = 1;")
+        (tmp_path / "lazy.mjs").write_text("export default 2;")
+        (tmp_path / "other.html").write_text("<html></html>")
+
+        output_dir = tmp_path / "mirror_output"
+        mirror_page(
+            f"file://{main}",
+            str(output_dir),
+            depth=1,
+            single_page=True,
+        )
+
+        assert (output_dir / "main.html").exists()
+        assert (output_dir / "app.mjs").exists()
+        # Imported modules (including the dynamically imported one) are saved.
+        assert (output_dir / "util.js").exists()
+        assert (output_dir / "lazy.mjs").exists()
+        # The standalone linked page is not downloaded.
+        assert not (output_dir / "other.html").exists()
 
 
 class TestSafeFilename:

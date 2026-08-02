@@ -231,6 +231,9 @@ FONT_SUFFIXES = (".woff", ".woff2", ".ttf", ".otf", ".eot")
 DOCUMENT_SUFFIXES = (".html", ".htm")
 RESOURCE_SUFFIXES = STYLE_SUFFIXES + IMAGE_SUFFIXES + FONT_SUFFIXES
 
+# Local JS modules pulled in via one page's own scripts (single-page mode).
+JS_SUFFIXES = (".js", ".mjs", ".jsx", ".ts", ".mts", ".cts", ".tsx")
+
 
 def _is_page_dependency(path: str) -> bool:
     """
@@ -387,6 +390,70 @@ def extract_css_dependencies(css: str, base_url: str) -> List[str]:
             deps.add(resolved)
 
     return list(deps)
+
+
+# A JS module import token. Matches the quoted specifier in a static
+# ``import ... from "..."``, side-effect ``import "..."``, re-export
+# ``export ... from "..."``, and dynamic ``import("...")``.
+_JS_IMPORT_PATTERN = re.compile(
+    r"""(?:import\s*\(|(?:import|export)\b[^;"')]*?\bfrom\s*|import\s+)(['"])"""
+    r"""([^'"]+)\1""",
+    re.IGNORECASE,
+)
+
+
+def extract_js_dependencies(js: str, base_url: str) -> List[str]:
+    """
+    Extract local module URLs imported by JavaScript content.
+
+    Recognizes ES module ``import ... from "..."``, ``export ... from "..."``,
+    ``import("...")``, and ``import "..."`` side-effect imports. Only module
+    specifiers that resolve to a local script file (or a path ending in a
+    script extension) are returned; bare package names and remote URLs are
+    left for the page's own script tags to resolve.
+
+    Args:
+        js: The JavaScript text to parse.
+        base_url: The base URL of the script, used to resolve relative imports.
+
+    Returns:
+        List of unique local module URLs referenced by the script.
+    """
+    # Strip comments so specifiers inside comments/URLs are ignored.
+    stripped = re.sub(r"//[^\n]*|/\*.*?\*/", "", js, flags=re.DOTALL)
+    modules = set()
+    for match in _JS_IMPORT_PATTERN.finditer(stripped):
+        specifier = match.group(2).strip()
+        if not specifier or specifier.startswith(("data:", "#", "http:", "https:")):
+            continue
+        resolved = urljoin(base_url, specifier)
+        parsed = urlparse(resolved)
+        if parsed.scheme != "file" and not specifier.startswith((".", "/")):
+            # Bare package/module name (e.g. "react"): not a local file.
+            continue
+        if filename_suffix(parsed.path) in JS_SUFFIXES:
+            modules.add(resolved)
+    return list(modules)
+
+
+def filename_suffix(pathname: str) -> str:
+    """
+    Return the lowercase file extension of a path, or ``""`` if none.
+
+    Handles query strings by operating on the path portion only.
+
+    Args:
+        pathname: A URL path or filename.
+
+    Returns:
+        The leading-dot lowercase extension (e.g. ``".js"``), or ``""``.
+    """
+    parsed = urlparse(pathname)
+    name = parsed.path if parsed.scheme else pathname
+    _, dot, ext = name.rpartition(".")
+    if not dot:
+        return ""
+    return ("." + ext).lower()
 
 
 def download_resource(
@@ -574,15 +641,23 @@ def _download_page_resources(
             continue
         success_count += 1
 
-        # Recurse into CSS dependencies only in single-page mode.
-        if single_page and _looks_like_css(resource):
-            css = _read_original(session, resource)
-            if css is None:
-                continue
-            base = resource.rstrip("/")
-            for dep in extract_css_dependencies(css, base):
-                if dep not in seen:
-                    queue.append(dep)
+        # Recurse into nested dependencies (CSS assets and JS module imports)
+        # only in single-page mode.
+        if single_page:
+            if _looks_like_css(resource):
+                css = _read_original(session, resource)
+                if css is not None:
+                    base = resource.rstrip("/")
+                    for dep in extract_css_dependencies(css, base):
+                        if dep not in seen:
+                            queue.append(dep)
+            elif _looks_like_js_module(resource):
+                js = _read_original(session, resource)
+                if js is not None:
+                    base = resource.rstrip("/")
+                    for dep in extract_js_dependencies(js, base):
+                        if dep not in seen:
+                            queue.append(dep)
 
     return (success_count, total_count)
 
@@ -599,6 +674,20 @@ def _looks_like_css(url: str) -> bool:
     """
     path = urlparse(url).path.lower()
     return path.endswith((".css", ".mcss", ".scss", ".less"))
+
+
+def _looks_like_js_module(url: str) -> bool:
+    """
+    Return True if a URL likely points at a JS module worth scanning.
+
+    Args:
+        url: The resource URL.
+
+    Returns:
+        True if the path ends with a JS-style extension.
+    """
+    path = urlparse(url).path.lower()
+    return path.endswith((".js", ".mjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"))
 
 
 def _read_original(session: Optional[requests.Session], url: str) -> Optional[str]:
