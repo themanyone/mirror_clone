@@ -342,6 +342,53 @@ def _is_html_doc(url: str) -> bool:
     return path.split("/")[-1].find(".") == -1
 
 
+# A CSS url(...) token: url("...") with optional surrounding whitespace.
+_CSS_URL_PATTERN = re.compile(
+    r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.IGNORECASE
+)
+_CSS_IMPORT_PATTERN = re.compile(
+    r"@import\s+(?:url\(([^)]+)\)|['\"]([^'\"]+)['\"])", re.IGNORECASE
+)
+
+
+def extract_css_dependencies(css: str, base_url: str) -> List[str]:
+    """
+    Extract image, font, and stylesheet URLs referenced from CSS content.
+
+    Handles both ``url(...)`` references (background images, fonts, etc.) and
+    ``@import`` statements (nested stylesheets).
+
+    Args:
+        css: The CSS text to parse.
+        base_url: The base URL of the stylesheet, used to resolve relative URLs.
+
+    Returns:
+        List of unique resource URLs referenced by the CSS.
+    """
+    deps = set()
+
+    for match in _CSS_URL_PATTERN.finditer(css):
+        value = match.group(2).strip().strip("'\"")
+        # Skip data: URIs.
+        if value.startswith(("data:", "#", "about:")):
+            continue
+        resolved = urljoin(base_url, value)
+        parsed = urlparse(resolved)
+        if parsed.scheme in ("http", "https", "file"):
+            deps.add(resolved)
+
+    for match in _CSS_IMPORT_PATTERN.finditer(css):
+        value = (match.group(1) or match.group(2) or "").strip().strip("'\"")
+        if not value:
+            continue
+        resolved = urljoin(base_url, value)
+        parsed = urlparse(resolved)
+        if parsed.scheme in ("http", "https", "file"):
+            deps.add(resolved)
+
+    return list(deps)
+
+
 def download_resource(
     session: Optional[requests.Session],
     url: str,
@@ -484,6 +531,107 @@ def _save_page(
     return content.decode("utf-8", errors="replace")
 
 
+def _download_page_resources(
+    session: Optional[requests.Session],
+    resources: List[str],
+    output_dir: Path,
+    referer: Optional[str],
+    max_depth: int,
+    single_page: bool,
+) -> int:
+    """
+    Download an initial set of resources, recursing into CSS dependencies.
+
+    In single-page mode the content of downloaded stylesheets is scanned for
+    ``url(...)`` and ``@import`` references (background images, fonts, nested
+    stylesheets) which are downloaded as well so that the page's CSS renders
+    with its assets intact.
+
+    Args:
+        session: Requests session (None for file:// URLs).
+        resources: Initial resource URLs to download.
+        output_dir: Directory to save files.
+        referer: Optional referer header.
+        max_depth: Maximum allowed recursion depth.
+        single_page: Whether to follow CSS-referenced assets.
+
+    Returns:
+        A tuple of ``(success_count, total_count)`` for downloaded resources.
+    """
+    seen: Set[str] = set()
+    queue = list(resources)
+    success_count = 0
+    total_count = 0
+
+    while queue:
+        resource = queue.pop(0)
+        time.sleep(0.1)
+        total_count += 1
+        saved = download_resource(
+            session, resource, output_dir, seen, referer, depth=1, max_depth=max_depth
+        )
+        if not saved:
+            continue
+        success_count += 1
+
+        # Recurse into CSS dependencies only in single-page mode.
+        if single_page and _looks_like_css(resource):
+            css = _read_original(session, resource)
+            if css is None:
+                continue
+            base = resource.rstrip("/")
+            for dep in extract_css_dependencies(css, base):
+                if dep not in seen:
+                    queue.append(dep)
+
+    return (success_count, total_count)
+
+
+def _looks_like_css(url: str) -> bool:
+    """
+    Return True if a URL likely points at a stylesheet worth scanning.
+
+    Args:
+        url: The resource URL.
+
+    Returns:
+        True if the path ends with a CSS-style extension.
+    """
+    path = urlparse(url).path.lower()
+    return path.endswith((".css", ".mcss", ".scss", ".less"))
+
+
+def _read_original(session: Optional[requests.Session], url: str) -> Optional[str]:
+    """
+    Read the raw content of a resource fetched from its origin.
+
+    Used to scan stylesheet bodies for nested dependency references.
+
+    Args:
+        session: Requests session (None for file:// URLs).
+        url: The resource URL to read.
+
+    Returns:
+        Decoded text content, or None if it could not be fetched.
+    """
+    if url.startswith("file://"):
+        local_path = urlparse(url).path
+        if not os.path.exists(local_path):
+            return None
+        with open(local_path, "rb") as f:
+            return f.read().decode("utf-8", errors="replace")
+
+    if session is None:
+        return None
+    try:
+        response = session.get(url, timeout=DEFAULT_TIMEOUT)
+        if response.status_code != 200:
+            return None
+        return response.content.decode("utf-8", errors="replace")
+    except requests.exceptions.RequestException:
+        return None
+
+
 def mirror_page(
     url: str,
     output_dir: str,
@@ -530,7 +678,7 @@ def mirror_page(
 
     session: Optional[requests.Session] = None
     success_count = 0
-    resources: List[str] = []
+    total_count = 0
 
     try:
         # No HTTP session needed for file:// URLs.
@@ -545,14 +693,10 @@ def mirror_page(
         base_url = normalized_url.rstrip("/")
         resources = extract_resources(html, base_url, single_page=single_page)
 
-        # Download resources
-        seen: Set[str] = set()
-        for resource in resources:
-            time.sleep(0.1)
-            if download_resource(
-                session, resource, output_path, seen, referer, depth=1, max_depth=depth
-            ):
-                success_count += 1
+        # Download resources, following CSS dependencies in single-page mode.
+        success_count, total_count = _download_page_resources(
+            session, resources, output_path, referer, depth, single_page
+        )
 
     finally:
         # Close session and release connection pool (if created)
@@ -561,7 +705,9 @@ def mirror_page(
 
     # Print summary
     print("-" * 60)
-    print("Complete: {}/{} resources downloaded".format(success_count, len(resources)))
+    print(
+        "Complete: {}/{} resources downloaded".format(success_count, total_count)
+    )
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:

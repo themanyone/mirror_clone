@@ -14,6 +14,7 @@ from mirror_page import (
     create_session,
     validate_url,
     extract_resources,
+    extract_css_dependencies,
     download_resource,
     mirror_page,
     parse_args,
@@ -116,6 +117,38 @@ class TestExtractResources:
             html, "http://example.com/", single_page=True
         )
         assert resources == []
+
+
+class TestExtractCssDependencies:
+    """Test CSS url(...) and @import extraction."""
+
+    def test_url_background_image(self):
+        """Should extract url(...) references."""
+        css = ".bg { background-image: url(images/bg.png); }"
+        deps = extract_css_dependencies(css, "http://example.com/css/style.css")
+        assert deps == ["http://example.com/css/images/bg.png"]
+
+    def test_quoted_and_unquoted_urls(self):
+        """Should handle both quoted and unquoted url() values."""
+        css = """
+        .a { background: url('a.png'); }
+        .b { background: url(b.png); }
+        """
+        deps = extract_css_dependencies(css, "http://example.com/")
+        assert "http://example.com/a.png" in deps
+        assert "http://example.com/b.png" in deps
+
+    def test_skips_data_uris(self):
+        """Should skip data: URIs."""
+        css = ".x { background: url(data:image/png;base64,AAAA); }"
+        deps = extract_css_dependencies(css, "http://example.com/")
+        assert deps == []
+
+    def test_import_nested_stylesheet(self):
+        """Should extract @import stylesheets."""
+        css = "@import url(other.css);"
+        deps = extract_css_dependencies(css, "http://example.com/css/main.css")
+        assert deps == ["http://example.com/css/other.css"]
 
 
 class TestCreateSession:
@@ -342,6 +375,39 @@ class TestMirrorPage:
         assert (output_dir / "image.png").exists()
         assert (output_dir / "app.js").exists()
         assert not (output_dir / "page2.html").exists()
+
+    def test_mirror_single_page_downloads_css_assets(self, tmp_path):
+        """Single-page mode should download images referenced from CSS."""
+        # Main page links only a stylesheet; the stylesheet references images.
+        main = tmp_path / "main.html"
+        main.write_text('<html><link rel="stylesheet" href="style.css"></html>')
+        (tmp_path / "style.css").write_text(
+            '.bg { background-image: url(images/bg.png); }'
+            '@import url(extra.css);'
+        )
+        (tmp_path / "extra.css").write_text(
+            '.x { background: url(img/icon.gif); }'
+        )
+        img_dir = tmp_path / "images"
+        img_dir.mkdir()
+        (img_dir / "bg.png").write_bytes(b"\x89PNG")
+        nested_img = tmp_path / "img"
+        nested_img.mkdir()
+        (nested_img / "icon.gif").write_bytes(b"GIF")
+
+        output_dir = tmp_path / "mirror_output"
+        mirror_page(
+            f"file://{main}",
+            str(output_dir),
+            depth=1,
+            single_page=True,
+        )
+
+        assert (output_dir / "main.html").exists()
+        assert (output_dir / "style.css").exists()
+        assert (output_dir / "extra.css").exists()
+        assert (output_dir / "bg.png").exists()
+        assert (output_dir / "icon.gif").exists()
 
 
 class TestSafeFilename:
