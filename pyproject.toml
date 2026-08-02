@@ -1,0 +1,30 @@
+[project]
+name = "mirror-clone"
+version = "0.1.0"
+description = "A robust web page mirroring utility"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "requests>=2.28.0",
+    "urllib3>=1.26.0",
+]
+
+[project.scripts]
+mirror-page = "mirror_page:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonfiles = "test_*.py"
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 88
+target-version = ["py38"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
