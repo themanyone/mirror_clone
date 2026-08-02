@@ -404,24 +404,30 @@ _JS_IMPORT_PATTERN = re.compile(
 
 def extract_js_dependencies(js: str, base_url: str) -> List[str]:
     """
-    Extract local module URLs imported by JavaScript content.
+    Extract local module and asset URLs referenced by JavaScript content.
 
-    Recognizes ES module ``import ... from "..."``, ``export ... from "..."``,
-    ``import("...")``, and ``import "..."`` side-effect imports. Only module
-    specifiers that resolve to a local script file (or a path ending in a
-    script extension) are returned; bare package names and remote URLs are
-    left for the page's own script tags to resolve.
+    In addition to ES module imports, JavaScript frequently injects CSS values
+    such as ``background-image:url("...")`` pointing at local images. Those are
+    resolved relative to the script's own directory and returned too.
+
+    Recognized forms:
+
+    - ``import ... from "..."``, ``export ... from "..."``, ``import("...")``
+    - ``import "..."`` side-effect imports
+    - ``url("path/to/image.webp")`` inline-URL references inside strings
 
     Args:
         js: The JavaScript text to parse.
         base_url: The base URL of the script, used to resolve relative imports.
 
     Returns:
-        List of unique local module URLs referenced by the script.
+        List of unique local module and asset URLs referenced by the script.
     """
     # Strip comments so specifiers inside comments/URLs are ignored.
     stripped = re.sub(r"//[^\n]*|/\*.*?\*/", "", js, flags=re.DOTALL)
-    modules = set()
+    deps: Set[str] = set()
+
+    # ES module imports (relative/local script files only).
     for match in _JS_IMPORT_PATTERN.finditer(stripped):
         specifier = match.group(2).strip()
         if not specifier or specifier.startswith(("data:", "#", "http:", "https:")):
@@ -432,8 +438,67 @@ def extract_js_dependencies(js: str, base_url: str) -> List[str]:
             # Bare package/module name (e.g. "react"): not a local file.
             continue
         if filename_suffix(parsed.path) in JS_SUFFIXES:
-            modules.add(resolved)
-    return list(modules)
+            deps.add(resolved)
+
+    # Inline url(...) references to local images/fonts (JS-injected CSS).
+    for match in _JS_INLINE_URL_PATTERN.finditer(stripped):
+        href = _sanitize_js_url(match.group(1))
+        if not href or href.startswith(("data:", "#", "http:", "https:")):
+            continue
+        suffix = filename_suffix(href)
+        if not suffix:
+            continue
+        if suffix in IMAGE_SUFFIXES or suffix in FONT_SUFFIXES:
+            resolved = urljoin(base_url, href)
+            deps.add(resolved)
+
+    return list(deps)
+
+
+# ``url(...)`` inside JS (possibly wrapped in another quoted string). The
+# content is captured for disambiguation to handle both ``url(img.png)`` and
+# JS that builds the value, e.g. ``url("'+path+'img.webp")``.
+_JS_INLINE_URL_PATTERN = re.compile(r"""url\(([^)]*)\)""", re.IGNORECASE)
+
+
+def _sanitize_js_url(value: str) -> str:
+    """
+    Reconstruct a plausible resource path from a JS url(...) value fragment.
+
+    JS often concatenates a runtime base path with a literal string, e.g.
+    ``url("'+path+'New-Social-Media-Icons.webp")``. When the value uses ``+``
+    string concatenation we keep the trailing quoted literal (the actual file
+    name) and discard the runtime variable part, so the resource can be
+    resolved relative to the script. Simple values pass through unchanged.
+
+    Args:
+        value: The raw content from inside ``url(...)``.
+
+    Returns:
+        A cleaned-up relative path to attempt to download.
+    """
+    cleaned = value.strip()
+
+    if "+" in cleaned:
+        # Keep the trailing quoted literal that names a real resource file.
+        parts = re.split(r"""['"]""", cleaned)
+        candidates = [p.strip() for p in parts if p.strip()]
+        for candidate in reversed(candidates):
+            seg = candidate.split("/")[-1].strip()
+            if filename_suffix(seg) in IMAGE_SUFFIXES or filename_suffix(seg) in FONT_SUFFIXES:
+                cleaned = candidate
+                break
+
+    cleaned = cleaned.replace("\\/", "/").strip()
+
+    # Take the trailing slash-segment that ends in a known resource; this
+    # discards leading runtime tokens when concatenation survived.
+    segments = [s for s in cleaned.split("/") if s and s != "."]
+    for i in range(len(segments) - 1, -1, -1):
+        seg = segments[i]
+        if filename_suffix(seg) in IMAGE_SUFFIXES or filename_suffix(seg) in FONT_SUFFIXES:
+            return "/".join(segments[i:])
+    return cleaned
 
 
 def filename_suffix(pathname: str) -> str:
@@ -688,8 +753,6 @@ def _looks_like_js_module(url: str) -> bool:
     """
     path = urlparse(url).path.lower()
     return path.endswith((".js", ".mjs", ".jsx", ".ts", ".mts", ".cts", ".tsx"))
-
-
 def _read_original(session: Optional[requests.Session], url: str) -> Optional[str]:
     """
     Read the raw content of a resource fetched from its origin.

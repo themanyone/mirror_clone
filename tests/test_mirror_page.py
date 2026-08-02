@@ -185,6 +185,30 @@ class TestExtractJsDependencies:
         deps = extract_js_dependencies(js, "http://example.com/js/app.js")
         assert deps == ["http://example.com/js/real.mjs"]
 
+    def test_inline_css_url_image(self):
+        """Should extract local images referenced by JS-injected CSS."""
+        js = 'el.style.background = "url(img/bg.jpg)";'
+        deps = extract_js_dependencies(js, "http://example.com/js/app.js")
+        assert deps == ["http://example.com/js/bg.jpg"]
+
+    def test_concatenated_js_url_image(self):
+        """Should resolve images whose path is built via concatenation."""
+        js = (
+            'var path = "/images/";'
+            'el.style.backgroundImage = \'url("\' + path + '
+            '\'New-Social-Media-Icons.webp")\';'
+        )
+        deps = extract_js_dependencies(
+            js, "http://example.com/js/mediaIcons.js"
+        )
+        assert deps == ["http://example.com/js/New-Social-Media-Icons.webp"]
+
+    def test_inline_js_url_skips_data_uri(self):
+        """Should skip data: URIs inside JS url() references."""
+        js = 'el.style.background = "url(data:image/png;base64,AAAA)";'
+        deps = extract_js_dependencies(js, "http://example.com/js/app.js")
+        assert deps == []
+
 
 class TestCreateSession:
     """Test session creation."""
@@ -476,6 +500,37 @@ class TestMirrorPage:
         assert (output_dir / "util.js").exists()
         assert (output_dir / "lazy.mjs").exists()
         # The standalone linked page is not downloaded.
+        assert not (output_dir / "other.html").exists()
+
+    def test_mirror_single_page_downloads_js_injected_image(self, tmp_path):
+        """Single-page mode should fetch images referenced from JS strings."""
+        main = tmp_path / "main.html"
+        main.write_text(
+            '<html><script src="js/mediaIcons.js"></script>'
+            '<a href="other.html">O</a></html>'
+        )
+        js_dir = tmp_path / "js"
+        js_dir.mkdir()
+        (js_dir / "mediaIcons.js").write_text(
+            'var path = "/images/";'
+            'el.style.backgroundImage = \'url("\' + path + '
+            '\'New-Social-Media-Icons.webp")\';'
+        )
+        (js_dir / "New-Social-Media-Icons.webp").write_bytes(b"WEBP")
+        (tmp_path / "other.html").write_text("<html></html>")
+
+        output_dir = tmp_path / "mirror_output"
+        mirror_page(
+            f"file://{main}",
+            str(output_dir),
+            depth=1,
+            single_page=True,
+        )
+
+        assert (output_dir / "main.html").exists()
+        assert (output_dir / "mediaIcons.js").exists()
+        # The image referenced from the JS-injected CSS is downloaded.
+        assert (output_dir / "New-Social-Media-Icons.webp").exists()
         assert not (output_dir / "other.html").exists()
 
 
