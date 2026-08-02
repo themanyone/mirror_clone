@@ -166,6 +166,7 @@ def download_resource(
     if depth > max_depth:
         print(f"Skipping (depth exceeded): {url}")
         return False
+    output_dir = Path(output_dir) if not isinstance(output_dir, Path) else output_dir
 
     filename = os.path.basename(urlparse(url).path)
     filepath = output_dir / filename
