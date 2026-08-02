@@ -20,11 +20,14 @@ import re
 import sys
 import time
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from typing import List, Optional, Set
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+DEFAULT_TIMEOUT = 30
 
 
 class MirrorError(Exception):
@@ -33,31 +36,36 @@ class MirrorError(Exception):
     pass
 
 
-def create_session(referer: str | None = None) -> requests.Session:
+def create_session(
+    referer: Optional[str] = None, verify: bool = True
+) -> requests.Session:
     """
     Create a requests.Session with connection pooling and retry logic.
 
     Args:
         referer: Optional referer header to include in requests.
+        verify: Whether to verify TLS certificates. Set to False to disable
+            certificate verification (e.g. for self-signed certs).
 
     Returns:
         Configured requests.Session instance.
     """
     session = requests.Session()
 
+    # Certificate verification applies to all HTTPS requests on this session.
+    session.verify = verify
+
     # Configure retry strategy for transient failures
     retry_strategy = Retry(
         total=3,
         backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504, 429],
+        status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
+        respect_retry_after_header=True,
     )
     adapter = HTTPAdapter(max_retries=retry_strategy)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
-    # File URLs don't need retries
-    file_adapter = HTTPAdapter(max_retries=0)
-    session.mount("file://", file_adapter)
 
     # Set default headers
     session.headers.update(
@@ -94,27 +102,187 @@ def validate_url(url: str) -> str:
     if not url:
         raise MirrorError("URL cannot be empty")
 
+    url = url.strip()
+
     # Strip protocol if missing
     if not urlparse(url).scheme:
         url = "https://" + url
 
-    # Basic pattern validation
-    pattern = r"^(https?|file)://[a-zA-Z0-9.\-/:_@?&=%#]+$"
-    if not re.match(pattern, url):
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https", "file"):
         raise MirrorError(
-            f"Invalid URL format: {url}. Expected http://, https://, or file://"
+            "Invalid URL format: {}. Expected http://, https://, or file://".format(url)
         )
+
+    # A valid URL must have a host (or a path for file:// URLs)
+    if not parsed.netloc and not (parsed.scheme == "file" and parsed.path):
+        raise MirrorError("Invalid URL format: missing host: {}".format(url))
 
     return url
 
 
-def extract_resources(html: str, base_url: str) -> list[str]:
+def _safe_path(url: str) -> Path:
+    """
+    Derive a safe relative path that preserves the URL's subdirectory layout.
+
+    Query strings and URL-encoded characters are stripped/decoded and each
+    path component is sanitized so resources are written to a mirrored
+    directory tree rather than collapsed into a single flat folder.
+
+    Args:
+        url: The resource URL.
+
+    Returns:
+        A filesystem-safe relative :class:`Path`.
+    """
+    parsed = urlparse(url)
+    path = unquote(parsed.path)
+
+    # For file:// URLs the path is an absolute local filesystem path, so there
+    # is no server-relative hierarchy to reproduce; keep just the basename.
+    if parsed.scheme == "file":
+        name = path.rsplit("/", 1)[-1] if path else ""
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+        return Path(name or "resource")
+
+    if not path or path == "/":
+        return Path("index")
+
+    raw_parts = path.strip("/").split("/")
+    parts = [
+        re.sub(r"[^A-Za-z0-9._-]", "_", part) or "resource"
+        for part in raw_parts
+        if part and part != "."
+    ]
+    if not parts:
+        return Path("index")
+
+    # A trailing slash denotes a directory-style URL; give it an index page.
+    if path.endswith("/"):
+        parts.append("index")
+
+    return Path(*parts)
+
+
+def _safe_filename(url: str) -> str:
+    """
+    Derive a safe, collision-resistant basename from a resource URL.
+
+    Query strings and URL-encoded characters are stripped and decoded so
+    that resources in different directories keep distinct names.
+
+    Args:
+        url: The resource URL.
+
+    Returns:
+        A filesystem-safe basename.
+    """
+    return _safe_path(url).name
+
+
+def write_resource(output_dir: Path, url: str, filename: str, content: bytes) -> bool:
+    """
+    Write downloaded bytes to disk, avoiding filename collisions.
+
+    If a file with the target name already exists, a numeric suffix is
+    appended so resources from different directories are not lost.
+
+    Args:
+        output_dir: Directory in which to save the file.
+        url: Origin URL (used for logging and collision messaging).
+        filename: Proposed filename, possibly a relative Path with subdirectories.
+        content: Raw bytes to write.
+
+    Returns:
+        True if the file was written, False if it already existed and was skipped.
+    """
+    output_dir = Path(output_dir)
+    filename = Path(filename)
+    filepath = output_dir / filename
+
+    if filepath.exists():
+        # Avoid overwriting: derive a unique name within the same subdirectory.
+        stem, dot, ext = filename.name.rpartition(".")
+        suffix = 1
+        while filepath.exists():
+            if dot:
+                candidate = filepath.parent / "{}_{}{}{}".format(stem, suffix, dot, ext)
+            else:
+                candidate = filepath.parent / "{}_{}".format(filename.name, suffix)
+            filepath = candidate
+            suffix += 1
+        print("Name collision, saving as {}: {}".format(filepath.name, url))
+
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    with open(filepath, "wb") as f:
+        f.write(content)
+    return True
+
+
+# Extensions identifying assets that are dependencies of one page rather than
+# standalone linked web pages. In single-page mode these are downloaded,
+# user-clickable HTML links are not.
+STYLE_SUFFIXES = (".css", ".js", ".mjs", ".map")
+IMAGE_SUFFIXES = (
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp",
+    ".avif", ".tiff", ".jfif",
+)
+FONT_SUFFIXES = (".woff", ".woff2", ".ttf", ".otf", ".eot")
+DOCUMENT_SUFFIXES = (".html", ".htm")
+RESOURCE_SUFFIXES = STYLE_SUFFIXES + IMAGE_SUFFIXES + FONT_SUFFIXES
+
+
+def _is_page_dependency(path: str) -> bool:
+    """
+    Return True if a URL path is an asset needed to render one page.
+
+    Extension-based check: styles, scripts, images, and fonts are dependencies;
+    HTML pages and documents without a known suffix are not.
+
+    Args:
+        path: The URL path string (may include a query string).
+
+    Returns:
+        True if the path suffix names a renderable page dependency.
+    """
+    lower = path.lower()
+    return lower.endswith(RESOURCE_SUFFIXES)
+
+
+def _resource_tag(html: str, pos: int) -> str:
+    """
+    Return the lowercase tag name that contains the attribute at ``pos``.
+
+    Args:
+        html: The raw HTML content being parsed.
+        pos: Index of the matched attribute value inside ``html``.
+
+    Returns:
+        The tag name (e.g. ``a``, ``iframe``, ``link``), or ``""`` if none.
+    """
+    tag_start = html.rfind("<", 0, pos)
+    if tag_start == -1:
+        return ""
+    tag = html[tag_start:pos].lstrip("<").strip()
+    return re.split(r"\s+", tag, maxsplit=1)[0].lower()
+
+
+# Tags that embed another document inline rather than linking to a separate page.
+_EMBED_TAGS = ("iframe", "embed", "object", "frame")
+
+
+def extract_resources(
+    html: str, base_url: str, single_page: bool = False
+) -> List[str]:
     """
     Extract all resource URLs from HTML content.
 
     Args:
         html: The HTML content to parse.
         base_url: The base URL for resolving relative URLs.
+        single_page: If True, only keep resources required to render this one
+            page (scripts, stylesheets, images, fonts, and embedded HTML
+            includes), skipping links to other standalone web pages.
 
     Returns:
         List of unique resource URLs to download.
@@ -128,17 +296,58 @@ def extract_resources(html: str, base_url: str) -> list[str]:
         link = groups[0] or groups[1]
         if link:
             resolved = urljoin(base_url, link.strip())
-            resources.add(resolved)
+            # Ignore fragments/anchor-only links (no fetchable resource).
+            parsed = urlparse(resolved)
+            if parsed.scheme in ("http", "https", "file") and (
+                parsed.path or parsed.query
+            ):
+                if single_page:
+                    pos = html.rfind(link)
+                    tag_name = _resource_tag(html, pos)
+                    # Embedded includes are dependencies of this page.
+                    is_embed = tag_name in _EMBED_TAGS
+                    # User-facing anchors and <link> tags to HTML pages are not
+                    # needed to render this page.
+                    is_linked_page = tag_name in ("a", "link") and _is_html_doc(
+                        urljoin(base_url, link.strip())
+                    )
+                    if is_linked_page:
+                        continue
+                    if not is_embed and not _is_page_dependency(parsed.path):
+                        continue
+                resources.add(resolved)
 
     return list(resources)
 
 
+def _is_html_doc(url: str) -> bool:
+    """
+    Return True if ``url`` likely resolves to a standalone HTML document.
+
+    Detects explicit ``.html``/``.htm`` suffixes and extensionless paths such
+    as ``/about`` or ``/products/``.
+
+    Args:
+        url: The fully resolved URL.
+
+    Returns:
+        True if the URL names an HTML-style document.
+    """
+    path = urlparse(url).path
+    if not path:
+        return False
+    lower = path.lower().rstrip("/")
+    if lower.endswith(DOCUMENT_SUFFIXES):
+        return True
+    return path.split("/")[-1].find(".") == -1
+
+
 def download_resource(
-    session: requests.Session,
+    session: Optional[requests.Session],
     url: str,
     output_dir: Path,
-    seen: set[str],
-    referer: str | None = None,
+    seen: Set[str],
+    referer: Optional[str] = None,
     depth: int = 0,
     max_depth: int = 1,
 ) -> bool:
@@ -146,7 +355,7 @@ def download_resource(
     Download a single resource with error handling.
 
     Args:
-        session: Requests session to use.
+        session: Requests session to use (None for file:// URLs).
         url: Resource URL to download.
         output_dir: Directory to save the file.
         seen: Set of already-processed URLs.
@@ -164,90 +373,124 @@ def download_resource(
 
     # Enforce depth limit
     if depth > max_depth:
-        print(f"Skipping (depth exceeded): {url}")
+        print("Skipping (depth exceeded): {}".format(url))
         return False
+
     output_dir = Path(output_dir) if not isinstance(output_dir, Path) else output_dir
 
-    filename = os.path.basename(urlparse(url).path)
-    filepath = output_dir / filename
-
-    # Skip if file already exists and is not a directory
-    if filepath.exists() and not filepath.is_dir():
-        print(f"Skipping (exists): {url}")
-        return False
+    filename = _safe_path(url)
 
     try:
         # Handle file:// URLs specially
         if url.startswith("file://"):
             local_path = urlparse(url).path
-            if os.path.exists(local_path):
-                with open(local_path, "rb") as src:
-                    content = src.read()
-                with open(filepath, "wb") as dst:
-                    dst.write(content)
-                return True
-            else:
-                print(f"File not found: {local_path}")
+            if not os.path.exists(local_path):
+                print("File not found: {}".format(local_path))
                 return False
+            with open(local_path, "rb") as src:
+                content = src.read()
+            return write_resource(output_dir, url, filename, content)
 
-        # For HTTP/HTTPS URLs, use requests
-        # Add referer header for this request
-        headers = dict(session.headers) if session else {}
-        if referer:
-            headers["Referer"] = referer
+        if session is None:
+            print("No session available for: {}".format(url))
+            return False
+
+        # Add referer header for this request.
+        headers = {"Referer": referer} if referer else None
 
         response = session.get(
             url,
-            timeout=30,
+            timeout=DEFAULT_TIMEOUT,
             headers=headers,
             stream=True,
         )
 
         # Validate response
         if response.status_code != 200:
-            print(f"Failed ({response.status_code}): {url}")
+            print("Failed ({}): {}".format(response.status_code, url))
             return False
 
-        # Parse content type to handle encoding
-        content_type = response.headers.get("Content-Type", "").lower()
-        is_text = "text/" in content_type or "application/json" in content_type
+        # Read the raw bytes; stream is used only to avoid holding unrelated
+        # large chunks in memory, which requests already streams internally.
+        content = response.content
 
-        if is_text:
-            # Try UTF-8 first, then fallback to response encoding
-            try:
-                text = response.text
-            except UnicodeDecodeError:
-                text = response.content.decode(
-                    response.encoding or "utf-8", errors="replace"
-                )
-        else:
-            text = response.content
-
-        # Write file
-        with open(filepath, "wb") as f:
-            f.write(text if not is_text else response.content)
-
-        return True
+        return write_resource(output_dir, url, filename, content)
 
     except requests.exceptions.Timeout:
-        print(f"Timeout: {url}")
+        print("Timeout: {}".format(url))
         return False
     except requests.exceptions.ConnectionError as e:
-        print(f"Connection error: {url} - {e}")
+        print("Connection error: {} - {}".format(url, e))
         return False
     except requests.exceptions.HTTPError as e:
-        print(f"HTTP error: {url} - {e}")
+        print("HTTP error: {} - {}".format(url, e))
         return False
     except Exception as e:
-        print(f"Unexpected error downloading {url}: {e}")
+        print("Unexpected error downloading {}: {}".format(url, e))
         return False
+
+
+def _save_page(
+    session: Optional[requests.Session],
+    url: str,
+    output_dir: Path,
+    referer: Optional[str],
+) -> Optional[str]:
+    """
+    Fetch and save a page's own content.
+
+    Returns the raw page text, or None on failure.
+
+    Args:
+        session: Requests session (None for file:// URLs).
+        url: The page URL.
+        output_dir: Directory to save the mirrored page.
+        referer: Optional referer header.
+
+    Returns:
+        The page text on success, None otherwise.
+    """
+    filename = _safe_path(url)
+
+    if url.startswith("file://"):
+        local_path = urlparse(url).path
+        if not os.path.exists(local_path):
+            print("File not found: {}".format(local_path), file=sys.stderr)
+            return None
+        with open(local_path, "rb") as f:
+            content = f.read()
+        write_resource(output_dir, url, filename, content)
+        return content.decode("utf-8", errors="replace")
+
+    if session is None:
+        return None
+
+    headers = {"Referer": referer} if referer else None
+    try:
+        response = session.get(url, timeout=DEFAULT_TIMEOUT, headers=headers)
+    except requests.exceptions.RequestException as e:
+        print("Failed to fetch page: {} - {}".format(url, e), file=sys.stderr)
+        return None
+
+    if response.status_code != 200:
+        print(
+            "Failed to fetch page (HTTP {}): {}".format(response.status_code, url),
+            file=sys.stderr,
+        )
+        return None
+
+    content = response.content
+    write_resource(output_dir, url, filename, content)
+    return content.decode("utf-8", errors="replace")
 
 
 def mirror_page(
     url: str,
     output_dir: str,
-    referer: str | None = None,
+    referer: Optional[str] = None,
     depth: int = 1,
+    verify: bool = True,
+    single_page: bool = False,
 ) -> None:
     """
     Mirror a web page and all its resources to a local directory.
@@ -258,114 +501,70 @@ def mirror_page(
         referer: Optional referer URL for requests.
         depth: Maximum recursive depth for downloading linked resources.
             Default is 1 (only direct links from the main page).
+        verify: Whether to verify TLS certificates during downloads.
+            Set to False to allow self-signed or invalid certificates.
+        single_page: If True, mirror only the assets this one page needs to
+            render (scripts, stylesheets, images, fonts, and embedded includes)
+            and skip links to other standalone web pages.
     """
     # Validate inputs
     try:
         normalized_url = validate_url(url)
     except MirrorError as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print("Error: {}".format(e), file=sys.stderr)
         sys.exit(1)
 
-    # Handle file:// URLs separately (requests doesn't support them)
-    if normalized_url.startswith("file://"):
-        local_path = urlparse(normalized_url).path
-        if not os.path.exists(local_path):
-            print(f"Error: File not found: {local_path}", file=sys.stderr)
+    # Create output directory
+    output_path = Path(output_dir).resolve()
+    try:
+        output_path.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(
+            "Error: Cannot create output directory '{}': {}".format(output_dir, e),
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print("Mirroring {} to {}".format(normalized_url, output_path))
+    print("-" * 60)
+
+    session: Optional[requests.Session] = None
+    success_count = 0
+    resources: List[str] = []
+
+    try:
+        # No HTTP session needed for file:// URLs.
+        if not normalized_url.startswith("file://"):
+            session = create_session(referer, verify)
+
+        # Fetch and save the page itself.
+        html = _save_page(session, normalized_url, output_path, referer)
+        if html is None:
             sys.exit(1)
 
-        # Initialize counters
-        resources: list[str] = []
-        success_count = 0
-
-        # Create output directory
-        output_path = Path(output_dir).resolve()
-        try:
-            output_path.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            print(f"Error: Cannot create output directory '{output_dir}': {e}", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"Mirroring {normalized_url} to {output_path}")
-        print("-" * 60)
-
-        try:
-            with open(local_path, "r", encoding="utf-8") as f:
-                html = f.read()
-            base_url = normalized_url
-            session = None  # No session needed for file:// URLs
-        except Exception as e:
-            print(f"Error: Failed to read file: {e}", file=sys.stderr)
-            sys.exit(1)
-
-        # Extract resources
-        resources = extract_resources(html, base_url)
+        base_url = normalized_url.rstrip("/")
+        resources = extract_resources(html, base_url, single_page=single_page)
 
         # Download resources
-        seen: set[str] = set()
+        seen: Set[str] = set()
         for resource in resources:
             time.sleep(0.1)
-            if download_resource(session, resource, output_path, seen, referer, depth=1, max_depth=depth):
+            if download_resource(
+                session, resource, output_path, seen, referer, depth=1, max_depth=depth
+            ):
                 success_count += 1
 
-    else:
-        # Initialize counters
-        resources: list[str] = []
-        success_count = 0
-
-        # Create output directory
-        output_path = Path(output_dir).resolve()
-        try:
-            output_path.mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            print(f"Error: Cannot create output directory '{output_dir}': {e}", file=sys.stderr)
-            sys.exit(1)
-
-        print(f"Mirroring {normalized_url} to {output_path}")
-        print("-" * 60)
-
-        # Create session with pooling and retry logic
-        session = create_session(referer)
-
-        try:
-            # Fetch the main page
-            try:
-                response = session.get(normalized_url, timeout=30)
-            except requests.exceptions.RequestException as e:
-                print(f"Error: Failed to fetch {normalized_url}: {e}", file=sys.stderr)
-                sys.exit(1)
-
-            # Validate response
-            if response.status_code != 200:
-                print(
-                    f"Error: Failed to fetch page (HTTP {response.status_code}): {normalized_url}"
-                )
-                sys.exit(1)
-
-            # Parse HTML and extract resources
-            html = response.text
-            base_url = normalized_url.rstrip("/")
-
-            # Extract resources
-            resources = extract_resources(html, base_url)
-
-            # Download resources
-            seen: set[str] = set()
-            for resource in resources:
-                time.sleep(0.1)
-                if download_resource(session, resource, output_path, seen, referer, depth=1, max_depth=depth):
-                    success_count += 1
-
-        finally:
-            # Close session and release connection pool (if created)
-            if session is not None:
-                session.close()
+    finally:
+        # Close session and release connection pool (if created)
+        if session is not None:
+            session.close()
 
     # Print summary
     print("-" * 60)
-    print(f"Complete: {success_count}/{len(resources)} resources downloaded")
+    print("Complete: {}/{} resources downloaded".format(success_count, len(resources)))
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     """
     Parse command-line arguments.
 
@@ -383,7 +582,8 @@ Examples:
   python mirror_page.py https://example.com ./mirror
   python mirror_page.py http://test.org/page.html ./output --referer http://test.org
   python mirror_page.py https://example.com ./mirror -r "http://example.com"
-        """
+  python mirror_page.py https://example.com ./mirror --single-page
+        """,
     )
 
     parser.add_argument(
@@ -400,7 +600,8 @@ Examples:
         "-r",
         "--referer",
         metavar="URL",
-        help="Referer header to include in requests (useful for sites that check origin)",
+        help=("Referer header to include in requests "
+              "(useful for sites that check origin)"),
     )
     parser.add_argument(
         "-d",
@@ -410,6 +611,22 @@ Examples:
         metavar="N",
         help="Maximum recursive depth for downloading linked resources (default: 1)",
     )
+    parser.add_argument(
+        "--single-page",
+        dest="single_page",
+        action="store_true",
+        help=(
+            "Mirror only the resources this one page needs to render "
+            "(scripts, styles, images, fonts, and embedded includes); "
+            "do not download links to other web pages"
+        ),
+    )
+    parser.add_argument(
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="Disable TLS certificate verification (e.g. for self-signed certs)",
+    )
 
     return parser.parse_args(argv)
 
@@ -418,22 +635,16 @@ def main() -> None:
     """Main entry point."""
     args = parse_args()
 
-    # Validate required arguments
-    if not args.url:
-        print("Error: URL is required", file=sys.stderr)
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.print_help()
-        sys.exit(1)
-
-    if not args.output_dir:
-        print("Error: Output directory is required", file=sys.stderr)
-        parser = argparse.ArgumentParser(add_help=False)
-        parser.print_help()
-        sys.exit(1)
-
     # Execute mirror operation
     try:
-        mirror_page(args.url, args.output_dir, args.referer, args.depth)
+        mirror_page(
+            args.url,
+            args.output_dir,
+            args.referer,
+            args.depth,
+            args.verify,
+            args.single_page,
+        )
     except KeyboardInterrupt:
         print("\nInterrupted by user", file=sys.stderr)
         sys.exit(130)

@@ -49,6 +49,7 @@ python mirror_page.py file:///path/to/page.html ./output
 |------|-------------|---------|
 | `-d, --depth N` | Maximum recursive depth for linked resources | 1 |
 | `-r, --referer URL` | Referer header for requests | None |
+| `--no-verify` | Disable TLS certificate verification (e.g. self-signed certs) | off |
 
 ## 🧪 Testing
 

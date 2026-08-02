@@ -4,23 +4,20 @@ Tests for mirror_page.py
 Run with: pytest tests/test_mirror_page.py -v
 """
 
-import os
-import sys
-import tempfile
-from pathlib import Path
-
 import pytest
-
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+from pathlib import Path
 
 from mirror_page import (
     MirrorError,
+    _safe_filename,
+    _safe_path,
     create_session,
     validate_url,
     extract_resources,
     download_resource,
     mirror_page,
+    parse_args,
+    write_resource,
 )
 
 
@@ -83,6 +80,43 @@ class TestExtractResources:
         resources = extract_resources(html, "http://example.com/")
         assert len(resources) == 1
 
+    def test_single_page_keeps_dependencies(self):
+        """Single-page mode should keep scripts, styles, and images."""
+        html = (
+            '<link rel="stylesheet" href="style.css">'
+            '<script src="app.js"></script><img src="img.png">'
+        )
+        resources = extract_resources(
+            html, "http://example.com/", single_page=True
+        )
+        assert "http://example.com/style.css" in resources
+        assert "http://example.com/app.js" in resources
+        assert "http://example.com/img.png" in resources
+
+    def test_single_page_skips_linked_html(self):
+        """Single-page mode should drop links to other web pages."""
+        html = '<a href="page2.html">Page 2</a><a href="/about">About</a>'
+        resources = extract_resources(
+            html, "http://example.com/", single_page=True
+        )
+        assert resources == []
+
+    def test_single_page_keeps_iframe_includes(self):
+        """Single-page mode should keep embedded HTML includes."""
+        html = '<iframe src="frame.html"></iframe>'
+        resources = extract_resources(
+            html, "http://example.com/", single_page=True
+        )
+        assert "http://example.com/frame.html" in resources
+
+    def test_single_page_skips_extensionless_links(self):
+        """Single-page mode should treat extensionless paths as pages."""
+        html = '<a href="/products">Product</a><link href="/team/">Team</a>'
+        resources = extract_resources(
+            html, "http://example.com/", single_page=True
+        )
+        assert resources == []
+
 
 class TestCreateSession:
     """Test session creation."""
@@ -103,6 +137,48 @@ class TestCreateSession:
         """Should set a default User-Agent."""
         session = create_session()
         assert "User-Agent" in session.headers
+
+    def test_verify_true_by_default(self):
+        """Should verify TLS certificates by default."""
+        session = create_session()
+        assert session.verify is True
+
+    def test_verify_false_disables_verification(self):
+        """Should disable TLS verification when verify=False."""
+        session = create_session(verify=False)
+        assert session.verify is False
+
+
+class TestParseArgs:
+    """Test command-line argument parsing."""
+
+    def test_verify_default_true(self):
+        """Should default to verifying TLS certificates."""
+        args = parse_args(["https://example.com", "./out"])
+        assert args.verify is True
+
+    def test_no_verify_flag(self):
+        """Should honour the --no-verify flag."""
+        args = parse_args(["https://example.com", "./out", "--no-verify"])
+        assert args.verify is False
+
+    def test_referer_and_depth_preserved(self):
+        """Should not disturb existing options."""
+        args = parse_args(
+            ["https://example.com", "./out", "-r", "http://ref", "-d", "3"]
+        )
+        assert args.referer == "http://ref"
+        assert args.depth == 3
+
+    def test_single_page_default_false(self):
+        """Should default single_page to False."""
+        args = parse_args(["https://example.com", "./out"])
+        assert args.single_page is False
+
+    def test_single_page_flag(self):
+        """Should honour the --single-page flag."""
+        args = parse_args(["https://example.com", "./out", "--single-page"])
+        assert args.single_page is True
 
 
 class TestDownloadResource:
@@ -185,6 +261,13 @@ class TestDownloadResource:
 class TestMirrorPage:
     """Test the main mirror_page function."""
 
+    def test_mirror_http_connection_error_exits_gracefully(self, tmp_path):
+        """Should exit cleanly with an error message on connection failure."""
+        output_dir = tmp_path / "output"
+        # Port 1 is closed in all practical environments, so connection is refused.
+        with pytest.raises(SystemExit):
+            mirror_page("http://127.0.0.1:1/page.html", str(output_dir), depth=1)
+
     @pytest.fixture
     def setup_test_page(self, tmp_path):
         """Create a test HTML page with linked resources."""
@@ -217,7 +300,8 @@ class TestMirrorPage:
             depth=1,
         )
 
-        # Main page is the source, not a resource to download
+        # The main page itself is now saved into the output directory.
+        assert (output_dir / "main.html").exists()
         assert (output_dir / "page2.html").exists()
         assert (output_dir / "image.png").exists()
 
@@ -232,3 +316,101 @@ class TestMirrorPage:
                 str(output_dir),
                 depth=1,
             )
+
+    def test_mirror_single_page_skips_linked_html(self, tmp_path):
+        """Single-page mode should skip linked pages but keep assets."""
+        # Main page links a second page and an image.
+        main = tmp_path / "main.html"
+        main.write_text(
+            '<html><a href="page2.html">P2</a><img src="image.png">'
+            '<script src="app.js"></script></html>'
+        )
+        (tmp_path / "page2.html").write_text("<html></html>")
+        (tmp_path / "image.png").write_bytes(b"\x89PNG")
+        (tmp_path / "app.js").write_text("console.log('hi')")
+
+        output_dir = tmp_path / "mirror_output"
+        mirror_page(
+            f"file://{main}",
+            str(output_dir),
+            depth=1,
+            single_page=True,
+        )
+
+        # The linked HTML page is not downloaded.
+        assert (output_dir / "main.html").exists()
+        assert (output_dir / "image.png").exists()
+        assert (output_dir / "app.js").exists()
+        assert not (output_dir / "page2.html").exists()
+
+
+class TestSafeFilename:
+    """Test safe filename derivation."""
+
+    def test_plain_filename(self):
+        """Should keep a simple filename."""
+        assert _safe_filename("http://example.com/style.css") == "style.css"
+
+    def test_subdirectory_filename(self):
+        """Should keep the basename when resource is nested."""
+        assert _safe_filename("http://example.com/assets/css/style.css") == "style.css"
+
+    def test_query_string_stripped(self):
+        """Should strip query strings from filenames."""
+        assert _safe_filename("http://example.com/image.png?v=2") == "image.png"
+
+    def test_url_encoded_characters(self):
+        """Should URL-decode the resource path before sanitizing."""
+        # Spaces are decoded then replaced with underscores for safety.
+        assert _safe_filename("http://example.com/my%20file.txt") == "my_file.txt"
+
+    def test_no_path_uses_index(self):
+        """Should fall back to a sane name when there is no path."""
+        assert _safe_filename("http://example.com") == "index"
+
+
+class TestSafePath:
+    """Test subdirectory-preserving relative path derivation."""
+
+    def test_flat_path(self):
+        """Should keep a simple single-file path."""
+        assert _safe_path("http://example.com/style.css") == Path("style.css")
+
+    def test_preserves_subdirectories(self):
+        """Should reproduce the URL's subdirectory layout."""
+        assert _safe_path("http://example.com/assets/css/style.css") == Path(
+            "assets/css/style.css"
+        )
+
+    def test_file_url_uses_basename(self):
+        """Should collapse file:// absolute paths to a basename."""
+        assert _safe_path("file:///tmp/site/css/style.css") == Path("style.css")
+
+    def test_directory_url_gets_index(self):
+        """Should append an index page for directory-style URLs."""
+        assert _safe_path("http://example.com/foo/bar/") == Path("foo/bar/index")
+
+    def test_query_string_stripped(self):
+        """Should strip query strings from the path."""
+        assert _safe_path("http://example.com/img/banner.png?v=2") == Path(
+            "img/banner.png"
+        )
+
+
+class TestWriteResource:
+    """Test collision-safe writing."""
+
+    def test_writes_content(self, tmp_path):
+        """Should write bytes to the output directory."""
+        result = write_resource(tmp_path, "http://example.com/a.txt", "a.txt", b"hello")
+        assert result is True
+        assert (tmp_path / "a.txt").read_bytes() == b"hello"
+
+    def test_name_collision_suffix(self, tmp_path):
+        """Should append a numeric suffix on name collisions."""
+        (tmp_path / "a.txt").write_bytes(b"original")
+        result = write_resource(tmp_path, "http://example.com/b/a.txt", "a.txt", b"new")
+        assert result is True
+        # Both files are preserved.
+        assert (tmp_path / "a.txt").read_bytes() == b"original"
+        assert (tmp_path / "a_1.txt").read_bytes() == b"new"
