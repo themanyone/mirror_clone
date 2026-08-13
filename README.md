@@ -1,6 +1,6 @@
 # Mirror Clone
 
-A robust, production-ready web page mirror utility that downloads HTML pages and all their linked resources to a local directory.
+A robust, modern web page mirror utility that downloads HTML pages and all their linked resources to a local directory.
 
 ## 🚀 Features
 
@@ -18,8 +18,8 @@ A robust, production-ready web page mirror utility that downloads HTML pages and
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/mirror-clone.git
-cd mirror-clone
+git clone https://github.com/themanyone/mirror_clone.git
+cd mirror_clone
 
 # Make executable
 chmod +x mirror_clone.py
@@ -69,7 +69,7 @@ pytest tests/ --cov=. --cov-report=html
 ## 📁 Project Structure
 
 ```
-mirror-clone/
+mirror_clone/
 ├── mirror_clone.py      # Main script
 ├── tests/              # Unit and integration tests
 ├── README.md           # This file

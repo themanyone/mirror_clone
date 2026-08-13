@@ -1,5 +1,5 @@
 [project]
-name = "mirror-clone"
+name = "mirror_clone"
 version = "0.1.0"
 description = "A robust web page mirroring utility"
 readme = "README.md"
@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mirror-page = "mirror_clone:main"
+mirror_clone = "mirror_clone:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
