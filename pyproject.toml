@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mirror-page = "mirror_page:main"
+mirror-page = "mirror_clone:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

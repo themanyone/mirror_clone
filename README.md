@@ -22,29 +22,29 @@ git clone https://github.com/your-username/mirror-clone.git
 cd mirror-clone
 
 # Make executable
-chmod +x mirror_page.py
+chmod +x mirror_clone.py
 
 # Run
-./mirror_page.py https://example.com ./output -d 2 -r "https://example.com"
+./mirror_clone.py https://example.com ./output -d 2 -r "https://example.com"
 ```
 
 ## 🛠️ Usage
 
 ```bash
 # Basic usage
-python mirror_page.py https://example.com ./mirror
+python mirror_clone.py https://example.com ./mirror
 
 # With referer header (bypasses origin checks)
-python mirror_page.py https://example.com ./mirror -r "https://example.com"
+python mirror_clone.py https://example.com ./mirror -r "https://example.com"
 
 # Recursive download up to depth 3
-python mirror_page.py https://example.com ./mirror -d 3
+python mirror_clone.py https://example.com ./mirror -d 3
 
 # Single-page mode: only the assets this one page needs to render
-python mirror_page.py https://example.com ./mirror --single-page
+python mirror_clone.py https://example.com ./mirror --single-page
 
 # Mirror a local file
-python mirror_page.py file:///path/to/page.html ./output
+python mirror_clone.py file:///path/to/page.html ./output
 ```
 
 ### Options
@@ -70,7 +70,7 @@ pytest tests/ --cov=. --cov-report=html
 
 ```
 mirror-clone/
-├── mirror_page.py      # Main script
+├── mirror_clone.py      # Main script
 ├── tests/              # Unit and integration tests
 ├── README.md           # This file
 ├── AGENTS.md           # Guidelines for AI agents

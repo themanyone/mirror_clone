@@ -14,7 +14,7 @@ Mirror Clone is a web page mirroring utility that downloads HTML pages and their
 
 | File | Purpose |
 |------|---------|
-| `mirror_page.py` | Main CLI tool - handles URL validation, HTTP requests, resource extraction, and file downloads |
+| `mirror_clone.py` | Main CLI tool - handles URL validation, HTTP requests, resource extraction, and file downloads |
 | `tests/` | Unit and integration tests for core functionality |
 | `pyproject.toml` | Project metadata, dependencies, and build configuration |
 
