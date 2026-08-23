@@ -19,11 +19,13 @@ import os
 import re
 import sys
 import time
+import warnings
 from pathlib import Path
 from typing import List, Optional, Set
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -54,6 +56,8 @@ def create_session(
 
     # Certificate verification applies to all HTTPS requests on this session.
     session.verify = verify
+    if not verify:
+        warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)
 
     # Configure retry strategy for transient failures
     retry_strategy = Retry(
