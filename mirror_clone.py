@@ -294,8 +294,11 @@ def extract_resources(
     Returns:
         List of unique resource URLs to download.
     """
-    # Match href/src attributes (scripts, styles, links, images, etc.)
-    pattern = r'href=["\']([^"\'>]+)["\']|src=["\']([^"\'>]+)["\']'
+    # Match href/src attributes (scripts, styles, links, images, etc.).
+    # Allow whitespace (including newlines) between = and the opening quote
+    # since real-world HTML often splits long attributes across lines, and
+    # tolerate any non-quote character inside the value.
+    pattern = r"""href\s*=\s*["']([^"'>]+)["']|src\s*=\s*["']([^"'>]+)["']"""
     matches = re.findall(pattern, html)
 
     resources = set()
